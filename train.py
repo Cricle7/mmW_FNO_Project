@@ -1,15 +1,16 @@
 import pytorch_lightning as pl
 from data_loader import DataModuleWrapper
 from model import FNO
+from sklearn.model_selection import train_test_split
 
 
 def main():
     root_dir = r"D:\Project\python\inversion\32to64数据集\32to64DataSet"
-
-    # 例如，训练集为 1~1000，验证集为 1001~1200
-    train_indices = list(range(1, 1001))
-    val_indices   = list(range(1001, 1201))
-
+    total_imgs = 10841
+    all_indices = list(range(total_imgs))
+    train_indices, val_indices = train_test_split(all_indices,
+                                                test_size=0.2,
+                                                random_state=42)    # 例如，训练集为 1~1000，验证集为 1001~1200
     dm = DataModuleWrapper(
         root_dir=root_dir,
         train_indices=train_indices,
