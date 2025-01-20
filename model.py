@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
 
 
 class fourier_conv_2d(nn.Module):
@@ -163,7 +165,23 @@ class FNO(pl.LightningModule):
         input_data, target_img = batch
         pred = self(input_data)
         loss = self.loss_func(pred, target_img)
+        psnr_values = []
+        ssim_values = []
+        pred_np = pred.detach().cpu().numpy()  # 将预测结果转为 NumPy 数组
+        tgt_np = target_img.detach().cpu().numpy()  # 将目标图像转为 NumPy 数组
+
+        # 计算整个 batch 的 PSNR 和 SSIM
+        for i in range(pred_np.shape[0]):
+            psnr_val = psnr(tgt_np[i, 0], pred_np[i, 0], data_range=1.0)
+            ssim_val = ssim(tgt_np[i, 0], pred_np[i, 0], data_range=1.0)
+            psnr_values.append(psnr_val)
+            ssim_values.append(ssim_val)
+
+        avg_psnr = sum(psnr_values) / len(psnr_values)
+        avg_ssim = sum(ssim_values) / len(ssim_values)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_psnr', avg_psnr, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_ssim', avg_ssim, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
