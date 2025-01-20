@@ -1,0 +1,13 @@
+*DataSet
+*lightning_logs
+*__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.o
+*.obj
+*.exe
+*.dylib
+*.so
