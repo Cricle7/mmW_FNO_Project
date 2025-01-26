@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 
 def main():
     # ====== 1) 加载模型权重 ======
-    ckpt_path = "./lightning_logs/version_0/checkpoints/epoch=899-step=8100.ckpt"
+    # ckpt_path = "./lightning_logs/version_0/checkpoints/epoch=899-step=8100.ckpt"
+    ckpt_path = "./checkpoints/model_epoch_epoch=379_val_loss=508.32.ckpt"
     model = FNO.load_from_checkpoint(ckpt_path)  # PyTorch Lightning的便捷接口
     model.eval()
     model.to('cpu')  # 如果有GPU可用的话，改成  model.to('cuda')
@@ -20,7 +21,7 @@ def main():
     # 这里举例：假设  data_loader.py 里有 MmwDataset(root_dir, ...)，负责加载 .mat 文件等
     test_dataset = MmwDataset(
         root_dir = r"D:\Project\python\inversion\32to64\32to64DataSet",
-        index_list=list(range(1101, 1211))
+        index_list=list(range(10800, 10841))
     )
 
     # 如果你想随机抽取一条样本，也可以不一定用 DataLoader；

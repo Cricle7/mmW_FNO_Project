@@ -11,3 +11,4 @@
 *.exe
 *.dylib
 *.so
+checkpoints

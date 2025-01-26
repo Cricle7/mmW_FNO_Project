@@ -17,7 +17,7 @@ def main():
         train_indices=train_indices,
         val_indices=val_indices,
         batch_size=256,  # 尝试相对大一些的batch_size，但也要看显存情况
-        num_workers=8
+        num_workers=24
     )
 
     model = FNO(
@@ -52,7 +52,7 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=900,
-        accelerator="gpu",  
+        accelerator="cpu",  
         devices=1,
         callbacks=[checkpoint_callback, lr_monitor, early_stop_callback],
         # log_every_n_steps=10  # 根据需要打印日志
