@@ -1,65 +1,83 @@
+# train.py
 import pytorch_lightning as pl
-from data_loader import DataModuleWrapper
-from model import FNO
-from sklearn.model_selection import train_test_split
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+import torch
+
+from data_module import MyDataModule
+from model import DeepONetFNOModel
 
 def main():
-    root_dir = "./32to64DataSet"
-    total_imgs = 10841
-    all_indices = list(range(1, total_imgs))
-    train_indices, val_indices = train_test_split(all_indices,
-                                                  test_size=0.2,
-                                                  random_state=42)
+    # 假设数据路径:
+    train_data_path = "train_data.mat"
+    test_data_path = "test_data.mat"
 
-    dm = DataModuleWrapper(
-        root_dir=root_dir,
-        train_indices=train_indices,
-        val_indices=val_indices,
-        batch_size=256,  # 尝试相对大一些的batch_size，但也要看显存情况
-        num_workers=24
+    # 这里仅示例, 请替换成实际数值
+    ntrain = 1000
+    ntest = 200
+    res = 10
+
+    # 1) 初始化 DataModule
+    dm = MyDataModule(
+        train_data_path=train_data_path,
+        test_data_path=test_data_path,
+        ntrain=ntrain,
+        ntest=ntest,
+        res=res,
+        batch_size=8
+    )
+    dm.setup()
+
+    # 2) 构造坐标网格 => (1, Nx*Ny, 2)
+    Nx, Ny = res, res
+    gridx = torch.linspace(0, 1, Nx)
+    gridy = torch.linspace(0, 1, Ny)
+    # 生成mesh
+    gx, gy = torch.meshgrid(gridx, gridy, indexing="ij")  # => (Nx, Ny)
+    grid = torch.stack([gx, gy], dim=-1).view(1, Nx * Ny, 2)
+
+    # 3) 配置DeepONet
+    deeponet_cfg = {
+        "input_dim": 2,
+        "operator_dims": [Nx * Ny],  # branch的输入维度(函数采样后flat)
+        "output_dim": 1,
+        "planes_branch": [64, 64],
+        "planes_trunk": [64, 64],
+        "grid": grid,   # 作为trunk的坐标
+        "learning_rate": 1e-3,
+        # ...
+    }
+
+    # 4) 实例化 DeepONetFNOModel
+    model = DeepONetFNOModel(
+        deeponet_cfg=deeponet_cfg,
+        fno_width=32,
+        fno_modes=16,
+        Nx=Nx,
+        Ny=Ny,
+        in_channels_for_fno=3  # 1通道(DeepONet输出) + 2通道(坐标)
     )
 
-    model = FNO(
-        modes=16,
-        width=32,
-        num_layers=4,
-        lr=1e-3,
-        weight_decay=1e-5,
-        eta_min=1e-5
-        # 若使用 ReduceLROnPlateau，可将 step_size/gamma 暂时忽略
-    )
-
-    # 回调1: 每20个epoch保存一次模型, 仅保留val_loss最小的那个权重
-    checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
+    # 5) 定义回调
+    checkpoint_cb = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
         save_top_k=1,
-        mode='min',
-        dirpath='checkpoints',
-        filename='model_epoch_{epoch:02d}_{val_loss:.2f}',
-        every_n_epochs=20
+        filename="deeponetfno-{epoch:02d}-{val_loss:.4f}"
     )
+    lr_monitor_cb = LearningRateMonitor(logging_interval="epoch")
 
-    # 回调2: 监控学习率(方便观察ReduceLROnPlateau何时降低lr)
-    lr_monitor = LearningRateMonitor(logging_interval='epoch')
-
-    # 回调3(可选): 若val_loss长时间不提升，可以提前停止
-    early_stop_callback = EarlyStopping(
-        monitor='val_loss',
-        patience=100,   # 可根据需要调整
-        mode='min'
-    )
-
+    # 6) Trainer
     trainer = pl.Trainer(
-        max_epochs=900,
-        accelerator="cpu",  
+        max_epochs=50,
+        accelerator="gpu",
         devices=1,
-        callbacks=[checkpoint_callback, lr_monitor, early_stop_callback],
-        # log_every_n_steps=10  # 根据需要打印日志
+        callbacks=[checkpoint_cb, lr_monitor_cb]
     )
 
     trainer.fit(model, dm)
 
+    # (可选) 测试
+    trainer.test(model, dm)
 
 if __name__ == "__main__":
     main()

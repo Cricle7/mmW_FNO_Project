@@ -1,223 +1,132 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
+import torch.nn.functional as F
 
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-# 若想用余弦退火，请取消注释下面两行
-# from torch.optim.lr_scheduler import CosineAnnealingLR
+from deeponet import DeepONetMulti
+from fno_blocks import FNOBlock
 
-# 评价指标
-from skimage.metrics import peak_signal_noise_ratio as psnr
-from skimage.metrics import structural_similarity as ssim
 
-class fourier_conv_2d(nn.Module):
+class DeepONetFNOModel(pl.LightningModule):
     """
-    做一次 2D Fourier Transform + 截断 + 卷积 的层
+    组合: DeepONet + FNO + FNO + FNO
+
+    架构思路:
+    1) DeepONet: 输入 (函数采样 + 坐标grid), 输出 (batch, NxNy, 1)
+    2) reshape => (batch, 1, Nx, Ny)
+    3) 第1个 FNOBlock => (batch, 1, Nx, Ny)
+    4) 第2个 FNOBlock => (batch, 1, Nx, Ny)
+    5) 第3个 FNOBlock => (batch, 1, Nx, Ny)
     """
-    def __init__(self, in_channels, out_channels, modes1, modes2):
+
+    def __init__(
+        self,
+        deeponet_cfg,
+        fno_width=32,
+        fno_modes=16,
+        Nx=10,
+        Ny=10,
+        in_channels_for_fno=3,
+        **kwargs
+    ):
         """
-        in_channels:  输入通道数
-        out_channels: 输出通道数
-        modes1, modes2: 在频域截断的模式数
+        deeponet_cfg: dict, 用于实例化 DeepONetMulti 的参数
+        Nx, Ny: 空间离散大小
+        in_channels_for_fno=3 表示: 1 通道(DeepONet输出) + 2 通道(坐标) => 3通道
         """
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes1 = modes1
-        self.modes2 = modes2
-
-        scale = 1 / (in_channels * out_channels)
-        # weights1、weights2 分别对应正向频率和负向频率上的可学习参数(复数用2个实数存储)
-        self.weights1 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, 2))
-        self.weights2 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, 2))
-
-    def compl_mul2d(self, input, weights):
-        """
-        复数乘法:
-        (batch, in_channel, x, y, 2) * (in_channel, out_channel, x, y, 2)
-        -> (batch, out_channel, x, y, 2)
-        """
-        return torch.einsum("bixyz,ioxyz->boxyz", input, weights)
-
-    def forward(self, x):
-        # x: (batch, in_channels, H, W)
-
-        # 1) 先做 2D FFT (rfft2)
-        #    rfft2 => 只保留实频+虚频一半 => 结果是复数，但 shape: [batch, channel, H, W//2+1]
-        x_ft = torch.fft.rfft2(x, dim=[-2, -1])  # complex64
-        # 转成 real+imag: shape => (batch, channel, H, W_half, 2)
-        x_ft = torch.view_as_real(x_ft)
-
-        batchsize = x_ft.shape[0]
-        _, _, height, width_half, _ = x_ft.shape
-
-        # 2) 构造输出在频域的张量
-        out_ft = torch.zeros(
-            batchsize,
-            self.out_channels,
-            height,
-            width_half,
-            2,               # real+imag
-            device=x.device,
-            dtype=x.dtype
-        )
-
-        # 截断并做复数乘法(正频率部分)
-        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(
-            x_ft[:, :, :self.modes1, :self.modes2], self.weights1
-        )
-        # 负频率部分
-        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(
-            x_ft[:, :, -self.modes1:, :self.modes2], self.weights2
-        )
-
-        # 3) IFFT 回到时域
-        out_ft = torch.view_as_complex(out_ft)
-        x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
-        return x
-
-
-class Fourier_layer(nn.Module):
-    """
-    把 fourier_conv_2d + 1x1 卷积 做一个残差块
-    """
-    def __init__(self, channels, modes, is_last=False):
-        super().__init__()
-        self.fourier_conv = fourier_conv_2d(channels, channels, modes, modes)
-        self.w = nn.Conv2d(channels, channels, kernel_size=1)
-        self.is_last = is_last
-
-    def forward(self, x):
-        # x: (batch, channels, H, W)
-        x1 = self.fourier_conv(x)
-        x2 = self.w(x)
-        out = x1 + x2
-        if not self.is_last:
-            out = F.gelu(out)
-        return out
-
-
-class FNO(pl.LightningModule):
-    """
-    FNO (Fourier Neural Operator) 模型示例:
-    - 输入: (batch, 2, 64, 64) (实部+虚部)
-    - 输出: (batch, 1, 64, 64) (灰度图)
-    """
-
-    def __init__(self,
-                 modes=16,
-                 width=32,
-                 num_layers=4,
-                 lr=1e-3,
-                 weight_decay=1e-5,
-                 eta_min=1e-5,
-                 # 如果你要使用别的调度器，可以保留这些参数:
-                 step_size=20,
-                 gamma=0.5
-                 ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.modes = modes
-        self.width = width
-        self.num_layers = num_layers
+        # 1) 初始化DeepONet
+        self.deeponet = DeepONetMulti(**deeponet_cfg)
 
-        # 输入通道数2(实+虚)，输出1(灰度)
-        self.input_channels = 2
-        self.output_channels = 1
+        # 2) 初始化三个 FNOBlock
+        self.fno1 = FNOBlock(
+            in_channels=in_channels_for_fno,
+            out_channels=1,
+            width=fno_width,
+            modes=fno_modes,
+            n_layers=1,  # 您可根据需要加深
+        )
+        self.fno2 = FNOBlock(
+            in_channels=1 + 2,  # 因为会再次拼坐标(1 通道输出 + 2D坐标)
+            out_channels=1,
+            width=fno_width,
+            modes=fno_modes,
+            n_layers=1,
+        )
+        self.fno3 = FNOBlock(
+            in_channels=1 + 2,
+            out_channels=1,
+            width=fno_width,
+            modes=fno_modes,
+            n_layers=1,
+        )
 
-        # 首先用1×1卷积把 2->width
-        self.fc0 = nn.Conv2d(self.input_channels, self.width, kernel_size=1)
+        self.Nx = Nx
+        self.Ny = Ny
 
-        # 堆叠若干 Fourier_layer
-        layers = []
-        for i in range(num_layers):
-            is_last = (i == num_layers - 1)
-            layers.append(Fourier_layer(self.width, self.modes, is_last=is_last))
-        self.fno_layers = nn.Sequential(*layers)
-
-        # 最后 1×1 卷积，把 width->1
-        self.fc1 = nn.Conv2d(self.width, self.output_channels, kernel_size=1)
-
-        # 损失函数
-        self.loss_func = nn.MSELoss()
-
-        # 优化器相关超参
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.eta_min = eta_min
-        self.step_size = step_size
-        self.gamma = gamma
+        # 这里的损失函数可视需求替换
+        self.criterion = nn.MSELoss()
 
     def forward(self, x):
         """
-        x: (batch, 2, 64, 64)
+        x: (B, Nx, Ny, 1) 表示函数采样, 
+        注: 也可传 (B, 1, Nx, Ny), 看您如何组织.
         """
-        x = self.fc0(x)           # => (batch, width, 64, 64)
-        x = self.fno_layers(x)    # => (batch, width, 64, 64)
-        x = self.fc1(x)           # => (batch, 1, 64, 64)
-        return x
+        B = x.shape[0]
+        # 先用 DeepONet 编码 => out_deeponet: (B, Nx*Ny, 1)
+        # DeepONet 需要 trunk 输入(坐标)在 self.deeponet.grid 中, 需要 branch 输入 = x.view(B, -1)
+        # 这里调用前, 确保 self.deeponet.grid = (1, Nx*Ny, 2)
+        x_branch = x.view(B, -1)
+        if self.deeponet.grid is None:
+            raise ValueError("Must provide grid to self.deeponet for trunk input")
+
+        y_var = self.deeponet.grid.repeat(B, 1, 1)  # (B, Nx*Ny, 2)
+        out_deeponet = self.deeponet([x_branch], y_var)  # => (B, Nx*Ny, 1)
+
+        # reshape => (B, Nx, Ny, 1)
+        out_dponet_2d = out_deeponet.view(B, self.Nx, self.Ny, 1)
+
+        # 现在我们想将(输出 + 坐标) 作为FNO的输入
+        # => (B, Nx, Ny, 3) = concat( out_dponet_2d, grid[...,0], grid[...,1] )
+        # 其中 grid_2d: (1, Nx, Ny, 2) => repeat到 (B, Nx, Ny, 2)
+        grid_2d = self.deeponet.grid.view(1, self.Nx, self.Ny, 2).repeat(B, 1, 1, 1)
+        # 拼通道
+        fno_in = torch.cat([out_dponet_2d, grid_2d], dim=-1)  # (B, Nx, Ny, 3)
+
+        # 调整为 (B, 3, Nx, Ny)
+        fno_in = fno_in.permute(0, 3, 1, 2).contiguous()
+        # 第1个FNO
+        fno_out1 = self.fno1(fno_in)  # => (B, 1, Nx, Ny)
+
+        # 拼坐标 => (B, (1+2), Nx, Ny)
+        fno_in2 = torch.cat([fno_out1, grid_2d.permute(0, 3, 1, 2)], dim=1)
+        fno_out2 = self.fno2(fno_in2)  # => (B, 1, Nx, Ny)
+
+        # 第3个FNO
+        fno_in3 = torch.cat([fno_out2, grid_2d.permute(0, 3, 1, 2)], dim=1)
+        fno_out3 = self.fno3(fno_in3)  # => (B, 1, Nx, Ny)
+
+        return fno_out3  # 最终输出
 
     def training_step(self, batch, batch_idx):
-        input_data, target_img = batch  # shapes: [B, 2, 64, 64], [B, 1, 64, 64]
-        pred = self(input_data)        # => [B, 1, 64, 64]
-        loss = self.loss_func(pred, target_img)
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        x, y = batch
+        # x: (B, Nx, Ny, 1), y: (B, Nx, Ny, 1)
+        pred = self.forward(x)  # => (B, 1, Nx, Ny)
+        loss = self.criterion(pred, y.permute(0, 3, 1, 2))  # y也调成 (B,1,Nx,Ny)
+        self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        input_data, target_img = batch
-        pred = self(input_data)
-        loss = self.loss_func(pred, target_img)
-
-        # 计算PSNR和SSIM (默认假设图像范围是[0,1])
-        pred_np = pred.detach().cpu().numpy()  # shape: [B,1,64,64]
-        tgt_np  = target_img.detach().cpu().numpy()  # shape: [B,1,64,64]
-        psnr_values = []
-        ssim_values = []
-
-        for i in range(pred_np.shape[0]):
-            psnr_val = psnr(tgt_np[i, 0], pred_np[i, 0], data_range=1.0)
-            ssim_val = ssim(tgt_np[i, 0], pred_np[i, 0], data_range=1.0)
-            psnr_values.append(psnr_val)
-            ssim_values.append(ssim_val)
-
-        avg_psnr = sum(psnr_values) / len(psnr_values)
-        avg_ssim = sum(ssim_values) / len(ssim_values)
-
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_psnr', avg_psnr, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_ssim', avg_ssim, on_step=False, on_epoch=True, prog_bar=True)
-
-        return loss
+        x, y = batch
+        pred = self.forward(x)
+        val_loss = self.criterion(pred, y.permute(0, 3, 1, 2))
+        self.log("val_loss", val_loss, prog_bar=True)
+        return val_loss
 
     def configure_optimizers(self):
-        """
-        使用ReduceLROnPlateau以在后期Loss不下降时自动降低学习率。
-        如果想改回CosineAnnealingLR或其他方式，请替换对应scheduler。
-        """
-        optimizer = AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-
-        # -- 1) ReduceLROnPlateau --------------------------------------
-        scheduler = {
-            "scheduler": ReduceLROnPlateau(
-                optimizer,
-                mode="min",       # 监控val_loss最小化
-                factor=0.5,       # 学习率衰减倍率
-                patience=20,      # 连续多少epoch val_loss不提升就衰减
-                min_lr=1e-6       # 学习率下限
-            ),
-            "monitor": "val_loss"  # 监控指标
-        }
-
-        # -- 2) 如果仍想用CosineAnnealingLR，可使用如下代码并注释上面的scheduler --
-        # scheduler = CosineAnnealingLR(
-        #     optimizer,
-        #     T_max=self.step_size,  # 周期长度
-        #     eta_min=self.eta_min
-        # )
-
+        # 简单示例: 使用AdamW, 或自行替换
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-5)
         return [optimizer], [scheduler]
