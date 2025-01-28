@@ -1,132 +1,92 @@
+import math
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
 import torch.nn.functional as F
-
-from deeponet import DeepONetMulti
-from fno_blocks import FNOBlock
-
-
-class DeepONetFNOModel(pl.LightningModule):
-    """
-    组合: DeepONet + FNO + FNO + FNO
-
-    架构思路:
-    1) DeepONet: 输入 (函数采样 + 坐标grid), 输出 (batch, NxNy, 1)
-    2) reshape => (batch, 1, Nx, Ny)
-    3) 第1个 FNOBlock => (batch, 1, Nx, Ny)
-    4) 第2个 FNOBlock => (batch, 1, Nx, Ny)
-    5) 第3个 FNOBlock => (batch, 1, Nx, Ny)
-    """
-
-    def __init__(
-        self,
-        deeponet_cfg,
-        fno_width=32,
-        fno_modes=16,
-        Nx=10,
-        Ny=10,
-        in_channels_for_fno=3,
-        **kwargs
-    ):
+import pytorch_lightning as pl
+from torch import optim
+from basic_layers import *
+class DeepONetFNO_LightningModel(pl.LightningModule):
+    def __init__(self,
+                 deepo_net: nn.Module,
+                 fno_net: nn.Module,
+                 Nx=32, Ny=32,
+                 lr=1e-3,
+                 weight_decay=1e-6):
         """
-        deeponet_cfg: dict, 用于实例化 DeepONetMulti 的参数
-        Nx, Ny: 空间离散大小
-        in_channels_for_fno=3 表示: 1 通道(DeepONet输出) + 2 通道(坐标) => 3通道
+        deepo_net: DeepONet 对象
+        fno_net  : FNO 对象
+        Nx, Ny   : 将 DeepONet 的输出重新映射到 Nx x Ny 的网格上(示例)
         """
         super().__init__()
-        self.save_hyperparameters()
-
-        # 1) 初始化DeepONet
-        self.deeponet = DeepONetMulti(**deeponet_cfg)
-
-        # 2) 初始化三个 FNOBlock
-        self.fno1 = FNOBlock(
-            in_channels=in_channels_for_fno,
-            out_channels=1,
-            width=fno_width,
-            modes=fno_modes,
-            n_layers=1,  # 您可根据需要加深
-        )
-        self.fno2 = FNOBlock(
-            in_channels=1 + 2,  # 因为会再次拼坐标(1 通道输出 + 2D坐标)
-            out_channels=1,
-            width=fno_width,
-            modes=fno_modes,
-            n_layers=1,
-        )
-        self.fno3 = FNOBlock(
-            in_channels=1 + 2,
-            out_channels=1,
-            width=fno_width,
-            modes=fno_modes,
-            n_layers=1,
-        )
-
+        self.deepo_net = deepo_net
+        self.fno_net = fno_net
         self.Nx = Nx
         self.Ny = Ny
 
-        # 这里的损失函数可视需求替换
         self.criterion = nn.MSELoss()
+        self.lr = lr
+        self.weight_decay = weight_decay
 
-    def forward(self, x):
+    def forward(self, func_vals, coords_1d, src=None):
         """
-        x: (B, Nx, Ny, 1) 表示函数采样, 
-        注: 也可传 (B, 1, Nx, Ny), 看您如何组织.
+        func_vals : (B, branch_in_dim)        - DeepONet 分支输入
+        coords_1d : (B, Nx*Ny, 2)            - DeepONet 主干输入 (二维坐标)
+        src       : (B, Nx, Ny) 或 (B, Nx, Ny, 2) (可选，若要做复数乘法)
+        返回      : FNO 预测结果
         """
-        B = x.shape[0]
-        # 先用 DeepONet 编码 => out_deeponet: (B, Nx*Ny, 1)
-        # DeepONet 需要 trunk 输入(坐标)在 self.deeponet.grid 中, 需要 branch 输入 = x.view(B, -1)
-        # 这里调用前, 确保 self.deeponet.grid = (1, Nx*Ny, 2)
-        x_branch = x.view(B, -1)
-        if self.deeponet.grid is None:
-            raise ValueError("Must provide grid to self.deeponet for trunk input")
+        # 1. 使用 DeepONet 得到 Nx*Ny 个坐标点上的函数值
+        B, total_points, _ = coords_1d.shape
+        # out_deepo: (B, Nx*Ny)
+        out_deepo = self.deepo_net(func_vals, coords_1d)  # (B, Nx*Ny)
 
-        y_var = self.deeponet.grid.repeat(B, 1, 1)  # (B, Nx*Ny, 2)
-        out_deeponet = self.deeponet([x_branch], y_var)  # => (B, Nx*Ny, 1)
+        # 2. 将 (B, Nx*Ny) reshape 为 (B, Nx, Ny)
+        out_deepo_2d = out_deepo.view(B, self.Nx, self.Ny)
+        # 3. 如果需要在 FNO 中拼接坐标，可以获取 get_grid2D:
+        grid = get_grid2D(out_deepo_2d.shape, out_deepo_2d.device)  # (B, Nx, Ny, 2)
 
-        # reshape => (B, Nx, Ny, 1)
-        out_dponet_2d = out_deeponet.view(B, self.Nx, self.Ny, 1)
+        # 4. 构造 FNO 的输入 (B, Nx, Ny, C)
+        #    这里简单示例：将 DeepONet 的函数值当作一维通道 + grid坐标 => dim_input = 3
+        #    如果 fno_net 初始化时 with_grid=True, dim_input=1+2=3
+        x_fno_in = torch.cat([out_deepo_2d.unsqueeze(-1), grid], dim=-1)
+        # x_fno_in: (B, Nx, Ny, 3)
 
-        # 现在我们想将(输出 + 坐标) 作为FNO的输入
-        # => (B, Nx, Ny, 3) = concat( out_dponet_2d, grid[...,0], grid[...,1] )
-        # 其中 grid_2d: (1, Nx, Ny, 2) => repeat到 (B, Nx, Ny, 2)
-        grid_2d = self.deeponet.grid.view(1, self.Nx, self.Ny, 2).repeat(B, 1, 1, 1)
-        # 拼通道
-        fno_in = torch.cat([out_dponet_2d, grid_2d], dim=-1)  # (B, Nx, Ny, 3)
-
-        # 调整为 (B, 3, Nx, Ny)
-        fno_in = fno_in.permute(0, 3, 1, 2).contiguous()
-        # 第1个FNO
-        fno_out1 = self.fno1(fno_in)  # => (B, 1, Nx, Ny)
-
-        # 拼坐标 => (B, (1+2), Nx, Ny)
-        fno_in2 = torch.cat([fno_out1, grid_2d.permute(0, 3, 1, 2)], dim=1)
-        fno_out2 = self.fno2(fno_in2)  # => (B, 1, Nx, Ny)
-
-        # 第3个FNO
-        fno_in3 = torch.cat([fno_out2, grid_2d.permute(0, 3, 1, 2)], dim=1)
-        fno_out3 = self.fno3(fno_in3)  # => (B, 1, Nx, Ny)
-
-        return fno_out3  # 最终输出
+        # 5. 传入 FNO
+        out_fno = self.fno_net(x_fno_in, src=src)
+        return out_fno
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        # x: (B, Nx, Ny, 1), y: (B, Nx, Ny, 1)
-        pred = self.forward(x)  # => (B, 1, Nx, Ny)
-        loss = self.criterion(pred, y.permute(0, 3, 1, 2))  # y也调成 (B,1,Nx,Ny)
+        """
+        假设 batch = (func_vals, coords_1d, src, y_true)
+        """
+        func_vals, coords_1d, src, y_true = batch
+        pred = self(func_vals, coords_1d, src)
+        # 如果 pred 是复数，视情况取实部/模等
+        if torch.is_complex(pred):
+            pred = pred.real  # 这里仅示例取实部
+
+        loss = self.criterion(pred.view(pred.size(0), -1),
+                              y_true.view(y_true.size(0), -1))
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        pred = self.forward(x)
-        val_loss = self.criterion(pred, y.permute(0, 3, 1, 2))
+        func_vals, coords_1d, src, y_true = batch
+        pred = self(func_vals, coords_1d, src)
+        if torch.is_complex(pred):
+            pred = pred.real
+        val_loss = self.criterion(pred.view(pred.size(0), -1),
+                                  y_true.view(y_true.size(0), -1))
         self.log("val_loss", val_loss, prog_bar=True)
         return val_loss
 
     def configure_optimizers(self):
-        # 简单示例: 使用AdamW, 或自行替换
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-5)
-        return [optimizer], [scheduler]
+        optimizer = optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # 也可使用余弦退火、StepLR 等
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",  # 按验证集 loss 调整学习率
+            },
+        }
