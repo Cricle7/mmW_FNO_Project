@@ -1,61 +1,67 @@
 import pytorch_lightning as pl
 from data_loader import DataModuleWrapper
-from model import FNO
+from operator_transformer import OperatorTransformer
 from sklearn.model_selection import train_test_split
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 
+
 def main():
-    root_dir = "./32to64DataSet"
+    root_dir = "../32to64DataSet"
     total_imgs = 10841
     all_indices = list(range(1, total_imgs))
-    train_indices, val_indices = train_test_split(all_indices,
-                                                  test_size=0.2,
-                                                  random_state=42)
+    train_indices, val_indices = train_test_split(
+        all_indices, test_size=0.2, random_state=42
+    )
 
     dm = DataModuleWrapper(
         root_dir=root_dir,
         train_indices=train_indices,
         val_indices=val_indices,
-        batch_size=256,  # 尝试相对大一些的batch_size，但也要看显存情况
+        batch_size=256,  # 可根据实际显存/速度需求调整
         num_workers=24
     )
 
-    model = FNO(
-        modes=16,
-        width=32,
-        num_layers=4,
-        lr=1e-3,
+    # 使用 OperatorTransformer 替换原先的 FNO
+    model = OperatorTransformer(
+        input_channels=2,   # 输入通道(实部+虚部)
+        in_emb_dim=96,
+        out_seq_emb_dim=256,
+        heads=4,
+        depth=6,
+        res=64,  # 跟 DataModule 里 resize 的尺寸对应
+        latent_channels=256,
+        out_channels=1,
+        scale=0.5,
+        learning_rate=1e-3,
+        step_size=100,
+        gamma=0.5,
         weight_decay=1e-5,
         eta_min=1e-5
-        # 若使用 ReduceLROnPlateau，可将 step_size/gamma 暂时忽略
     )
 
-    # 回调1: 每20个epoch保存一次模型, 仅保留val_loss最小的那个权重
+    # 回调1: 每20个epoch保存一次模型, 仅保留 val_loss 最小的
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
         save_top_k=1,
         mode='min',
         dirpath='checkpoints',
-        filename='model_epoch_{epoch:02d}_{val_loss:.2f}',
+        filename='model_epoch_{epoch:02d}_{val_loss:.4f}',
         every_n_epochs=20
     )
-
-    # 回调2: 监控学习率(方便观察ReduceLROnPlateau何时降低lr)
+    # 回调2: 监控学习率
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
-
-    # 回调3(可选): 若val_loss长时间不提升，可以提前停止
+    # 回调3: 早停
     early_stop_callback = EarlyStopping(
         monitor='val_loss',
-        patience=100,   # 可根据需要调整
+        patience=100,
         mode='min'
     )
 
     trainer = pl.Trainer(
         max_epochs=900,
-        accelerator="cpu",  
+        accelerator="gpu",  # 如果有 GPU, 可换成 "gpu", devices=1(或其他数量)
         devices=1,
         callbacks=[checkpoint_callback, lr_monitor, early_stop_callback],
-        # log_every_n_steps=10  # 根据需要打印日志
     )
 
     trainer.fit(model, dm)

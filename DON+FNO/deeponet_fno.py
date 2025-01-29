@@ -4,8 +4,16 @@ import pytorch_lightning as pl
 from deeponet import DeepONetMulti
 from fno import FNO
 
-from basic_layers import get_grid2D
-
+def get_grid2D(Nx, Ny, device):
+    gridx = torch.linspace(0, 1, Nx, device=device)
+    gridy = torch.linspace(0, 1, Ny, device=device)
+    x, y = torch.meshgrid(gridx, gridy, indexing='ij')  # (Nx, Ny)
+    x = x.reshape(-1, 1)  # => (Nx*Ny, 1)
+    y = y.reshape(-1, 1)  # => (Nx*Ny, 1)
+    grid = torch.cat([x, y], dim=-1)    # => (Nx*Ny, 2)
+    # 加个 batch 维度 => (1, Nx*Ny, 2)
+    grid = grid.unsqueeze(0)
+    return grid
 class DeepONetFNO(pl.LightningModule):
     """
     示例：同时初始化 DeepONetMulti 与 FNO，并在 forward 中做一次简单串联。

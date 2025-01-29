@@ -55,21 +55,17 @@ class FourierConv2d(nn.Module):
         x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
         return x
 
-
 class FourierLayer(nn.Module):
-    """
-    包装: fourier_conv_2d + 1x1 卷积 + 残差
-    """
-    def __init__(self, channels, modes, is_last=False):
+    def __init__(self, features_, wavenumber, is_last=False):
         super().__init__()
-        self.fourier_conv = FourierConv2d(channels, channels, modes, modes)
-        self.w = nn.Conv2d(channels, channels, 1)
-        self.is_last = is_last
+        self.W = nn.Conv2d(features_, features_, 1)
+        self.fourier_conv = FourierConv2d(features_, features_, *wavenumber)
+        if not is_last:
+            self.act = F.gelu
+        else:
+            self.act = nn.Identity()
 
     def forward(self, x):
-        y = self.fourier_conv(x)
-        y2 = self.w(x)
-        out = y + y2
-        if not self.is_last:
-            out = F.gelu(out)
-        return out
+        x1 = self.fourier_conv(x)
+        x2 = self.W(x)
+        return self.act(x1 + x2)
